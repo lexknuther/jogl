@@ -27,15 +27,22 @@
  */
 package com.jogamp.nativewindow.swt;
 
+import java.util.Objects;
+
 import com.jogamp.common.os.Platform;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 
+import org.eclipse.swt.SWT;
 import org.eclipse.swt.graphics.GCData;
 import org.eclipse.swt.graphics.Rectangle;
+import org.eclipse.swt.internal.DPIUtil;
+import org.eclipse.swt.internal.Library;
+import org.eclipse.swt.internal.gtk.OS;
 import org.eclipse.swt.widgets.Control;
+import org.eclipse.swt.widgets.Scrollable;
 
 import com.jogamp.nativewindow.AbstractGraphicsScreen;
 import com.jogamp.nativewindow.NativeWindowException;
@@ -51,9 +58,12 @@ import com.jogamp.nativewindow.x11.X11GraphicsDevice;
 
 import jogamp.nativewindow.macosx.OSXUtil;
 import jogamp.nativewindow.x11.X11Lib;
+import jogamp.nativewindow.Debug;
 
 public class SWTAccessor {
-    private static final boolean DEBUG = true;
+    private static final boolean DEBUG = Debug.debug("SWT");
+
+    private static final Method swt_scrollable_clientAreaInPixels;
 
     private static final Field swt_control_handle;
     private static final boolean swt_uses_long_handles;
@@ -81,7 +91,9 @@ public class SWTAccessor {
     private static final String str_internal_new_GC = "internal_new_GC";
     private static final String str_internal_dispose_GC = "internal_dispose_GC";
 
-    private static final String str_OS_gtk_class = "org.eclipse.swt.internal.gtk.OS";
+    private static final String str_OS_gtk_class = "org.eclipse.swt.internal.gtk.OS";    // used by earlier versions of SWT
+    private static final String str_GTK_gtk_class = "org.eclipse.swt.internal.gtk.GTK";  // used by later versions of SWT
+    private static final String str_GDK_gtk_class = "org.eclipse.swt.internal.gtk.GDK";  // used by later versions of SWT
     public static final Class<?> OS_gtk_class;
     private static final String str_OS_gtk_version = "GTK_VERSION";
     public static final VersionNumber OS_gtk_version;
@@ -96,6 +108,7 @@ public class SWTAccessor {
     private static final Method OS_gdk_x11_drawable_get_xid;
     private static final Method OS_gdk_x11_window_get_xid;
     private static final Method OS_gdk_window_set_back_pixmap;
+    private static final Method OS_gdk_window_set_background_pattern;
 
     private static final String str_gtk_widget_realize = "gtk_widget_realize";
     private static final String str_gtk_widget_unrealize = "gtk_widget_unrealize";
@@ -107,9 +120,11 @@ public class SWTAccessor {
     private static final String str_gdk_x11_drawable_get_xid = "gdk_x11_drawable_get_xid";
     private static final String str_gdk_x11_window_get_xid = "gdk_x11_window_get_xid";
     private static final String str_gdk_window_set_back_pixmap = "gdk_window_set_back_pixmap";
+    private static final String str_gdk_window_set_background_pattern = "gdk_window_set_background_pattern";
 
     private static final VersionNumber GTK_VERSION_2_14_0 = new VersionNumber(2, 14, 0);
     private static final VersionNumber GTK_VERSION_2_24_0 = new VersionNumber(2, 24, 0);
+    private static final VersionNumber GTK_VERSION_2_90_0 = new VersionNumber(2, 90, 0);
     private static final VersionNumber GTK_VERSION_3_0_0  = new VersionNumber(3,  0, 0);
 
     private static VersionNumber GTK_VERSION(final int version) {
@@ -118,6 +133,12 @@ public class SWTAccessor {
         final int minor = ( version >>  8 ) & 0xff;
         final int major = ( version >> 16 ) & 0xff;
         return new VersionNumber(major, minor, micro);
+    }
+
+    private static class ForceGtk2Holder {
+        private static final int SWT_4_10 = 4922;
+        private static final boolean force_gtk2 =
+                SWT.getVersion() < SWT_4_10 && Objects.equals(OS.getEnvironmentalVariable("SWT_GTK3"), "0");
     }
 
     static {
@@ -132,6 +153,18 @@ public class SWTAccessor {
         isOSX = NativeWindowFactory.TYPE_MACOSX == nwt;
         isWindows = NativeWindowFactory.TYPE_WINDOWS == nwt;
         isX11 = NativeWindowFactory.TYPE_X11 == nwt;
+
+        Method m = null;
+        try {
+            m = Scrollable.class.getDeclaredMethod("getClientAreaInPixels");
+            m.setAccessible(true);
+        } catch (final Exception ex) {
+            m = null;
+            if( DEBUG ) {
+                System.err.println("getClientAreaInPixels not implemented: "+ex.getMessage());
+            }
+        }
+        swt_scrollable_clientAreaInPixels = m;
 
         Field f = null;
         if( !isOSX ) {
@@ -153,7 +186,7 @@ public class SWTAccessor {
         // System.err.println("SWT long handles: " + swt_uses_long_handles);
         // System.err.println("Platform 64bit: "+Platform.is64Bit());
 
-        Method m=null;
+        m=null;
         try {
             m = ReflectionUtil.getMethod(Control.class, str_internal_new_GC, new Class[] { GCData.class });
         } catch (final Exception ex) {
@@ -161,6 +194,7 @@ public class SWTAccessor {
         }
         swt_control_internal_new_GC = m;
 
+        m=null;
         try {
             if(swt_uses_long_handles) {
                 m = Control.class.getDeclaredMethod(str_internal_dispose_GC, new Class[] { long.class, GCData.class });
@@ -172,41 +206,59 @@ public class SWTAccessor {
         }
         swt_control_internal_dispose_GC = m;
 
-        Class<?> c=null;
+        Class<?> cGTK=null;
         VersionNumber _gtk_version = new VersionNumber(0, 0, 0);
-        Method m1=null, m2=null, m3=null, m4=null, m5=null, m6=null, m7=null, m8=null, m9=null, ma=null;
+        Method m1=null, m2=null, m3=null, m4=null, m5=null, m6=null, m7=null, m8=null, m9=null, ma=null, mb=null;
         final Class<?> handleType = swt_uses_long_handles  ? long.class : int.class ;
         if( isX11 ) {
             // mandatory
             try {
-                c = ReflectionUtil.getClass(str_OS_gtk_class, false, SWTAccessor.class.getClassLoader());
-                final Field field_OS_gtk_version = c.getField(str_OS_gtk_version);
+                final ClassLoader cl = SWTAccessor.class.getClassLoader();
+                cGTK = ReflectionUtil.getClass(str_OS_gtk_class, false, cl);
+                Field field_OS_gtk_version;
+                Class<?> cGDK=cGTK;  // used for newer versions of SWT that have a org.eclipse.swt.internal.gtk.GDK object
+                try {
+                    field_OS_gtk_version = cGTK.getField(str_OS_gtk_version);
+                } catch (final NoSuchFieldException ex) {
+                    // if the GTK_VERSION field didn't exist in org.eclipse.swt.internal.gtk.OS, then look for
+                    // it in org.eclipse.swt.internal.gtk.GTK, where it was moved in later versions of SWT
+                    cGTK = ReflectionUtil.getClass(str_GTK_gtk_class, false, cl);
+                    field_OS_gtk_version = cGTK.getField(str_OS_gtk_version);
+                    cGDK = ReflectionUtil.getClass(str_GDK_gtk_class, false, cl);
+                }
                 _gtk_version = GTK_VERSION(field_OS_gtk_version.getInt(null));
-                m1 = c.getDeclaredMethod(str_gtk_widget_realize, handleType);
+                m1 = cGTK.getDeclaredMethod(str_gtk_widget_realize, handleType);
                 if (_gtk_version.compareTo(GTK_VERSION_2_14_0) >= 0) {
-                    m4 = c.getDeclaredMethod(str_gtk_widget_get_window, handleType);
+                    m4 = cGTK.getDeclaredMethod(str_gtk_widget_get_window, handleType);
                 } else {
-                    m3 = c.getDeclaredMethod(str_GTK_WIDGET_WINDOW, handleType);
+                    m3 = cGTK.getDeclaredMethod(str_GTK_WIDGET_WINDOW, handleType);
                 }
                 if (_gtk_version.compareTo(GTK_VERSION_2_24_0) >= 0) {
-                    m6 = c.getDeclaredMethod(str_gdk_x11_display_get_xdisplay, handleType);
-                    m7 = c.getDeclaredMethod(str_gdk_window_get_display, handleType);
+                    m6 = cGDK.getDeclaredMethod(str_gdk_x11_display_get_xdisplay, handleType);
+                    m7 = cGDK.getDeclaredMethod(str_gdk_window_get_display, handleType);
                 } else {
-                    m5 = c.getDeclaredMethod(str_gdk_x11_drawable_get_xdisplay, handleType);
+                    m5 = cGTK.getDeclaredMethod(str_gdk_x11_drawable_get_xdisplay, handleType);
                 }
                 if (_gtk_version.compareTo(GTK_VERSION_3_0_0) >= 0) {
-                    m9 = c.getDeclaredMethod(str_gdk_x11_window_get_xid, handleType);
+                    m9 = cGDK.getDeclaredMethod(str_gdk_x11_window_get_xid, handleType);
+                } else if (ForceGtk2Holder.force_gtk2) {
+                    m8 = cGDK.getDeclaredMethod(str_gdk_x11_drawable_get_xid, handleType);
                 } else {
-                    m8 = c.getDeclaredMethod(str_gdk_x11_drawable_get_xid, handleType);
+                    m8 = cGTK.getDeclaredMethod(str_gdk_x11_drawable_get_xid, handleType);
                 }
-                ma = c.getDeclaredMethod(str_gdk_window_set_back_pixmap, handleType, handleType, boolean.class);
+
+                if (_gtk_version.compareTo(GTK_VERSION_2_90_0) >= 0 || ForceGtk2Holder.force_gtk2) {
+                    mb = cGDK.getDeclaredMethod(str_gdk_window_set_background_pattern, handleType, handleType);
+                } else {
+                    ma = cGTK.getDeclaredMethod(str_gdk_window_set_back_pixmap, handleType, handleType, boolean.class);
+                }
             } catch (final Exception ex) { throw new NativeWindowException(ex); }
             // optional
             try {
-                m2 = c.getDeclaredMethod(str_gtk_widget_unrealize, handleType);
+                m2 = cGTK.getDeclaredMethod(str_gtk_widget_unrealize, handleType);
             } catch (final Exception ex) { }
         }
-        OS_gtk_class = c;
+        OS_gtk_class = cGTK;
         OS_gtk_version = _gtk_version;
         OS_gtk_widget_realize = m1;
         OS_gtk_widget_unrealize = m2;
@@ -218,6 +270,7 @@ public class SWTAccessor {
         OS_gdk_x11_drawable_get_xid = m8;
         OS_gdk_x11_window_get_xid = m9;
         OS_gdk_window_set_back_pixmap = ma;
+        OS_gdk_window_set_background_pattern = mb;
 
         isX11GTK = isX11 && null != OS_gtk_class;
 
@@ -235,6 +288,10 @@ public class SWTAccessor {
 
     private static void callStaticMethodL2V(final Method m, final long arg) {
         ReflectionUtil.callMethod(null, m, new Object[] { getIntOrLong(arg) });
+    }
+
+    private static void callStaticMethodLL2V(final Method m, final long arg0, final long arg1) {
+        ReflectionUtil.callMethod(null, m, new Object[] { getIntOrLong(arg0), getIntOrLong(arg1) });
     }
 
     private static void callStaticMethodLLZ2V(final Method m, final long arg0, final long arg1, final boolean arg3) {
@@ -309,12 +366,55 @@ public class SWTAccessor {
     }
 
     public static void gdk_window_set_back_pixmap(final long window, final long pixmap, final boolean parent_relative) {
-        callStaticMethodLLZ2V(OS_gdk_window_set_back_pixmap, window, pixmap, parent_relative);
+       if(OS_gdk_window_set_back_pixmap != null) {
+           callStaticMethodLLZ2V(OS_gdk_window_set_back_pixmap, window, pixmap, parent_relative);
+       }
+       // in recent GTK, can't set background to pixmap any more; this sets it relative to parent
+       else if(OS_gdk_window_set_background_pattern != null) {
+               callStaticMethodLL2V(OS_gdk_window_set_background_pattern, window, 0);
+       }
     }
 
     //
     // Common any toolkit
     //
+
+    /**
+     * Returns the unscaled {@link Scrollable#getClientArea()} in pixels.
+     * <p>
+     * If the package restricted method {@link Scrollable#getClientAreaInPixels()}
+     * is implemented, we return its result.
+     * </p>
+     * <p>
+     * Fallback is to return {@link DPIUtil#autoScaleUp(Rectangle) DPIUtil#autoScaleUp}({@link Scrollable#getClientArea()}),
+     * reverting  {@link Scrollable#getClientArea()}'s {@link DPIUtil#autoScaleDown(Rectangle)}.
+     * </p>
+     * <p>
+     * Note to SWT's API spec writers: You need to allow access to the unscaled value, scale properties and define what is being scaled (fonts, images, ..).
+     * Further more the scale should be separate for x/y coordinates, as DPI differs here.
+     * </p>
+     * <p>
+     * Note to Eclipse authors: Scaling up the fonts and images hardly works on GTK/SWT/Eclipse.
+     * GDK_SCALE, GDK_DPI_SCALE and swt.autoScale produce inconsistent results with Eclipse.
+     * Broken High-DPI for .. some years now.
+     * </p>
+     *
+     * Requires SWT >= 3.105 (DPIUtil)
+     *
+     * @param s the {@link Scrollable} instance
+     * @return unscaled client area in pixels, see above
+     * @throws NativeWindowException during invocation of the method, if any
+     */
+    public static Rectangle getClientAreaInPixels(final Scrollable s) throws NativeWindowException {
+        if( null == swt_scrollable_clientAreaInPixels ) {
+            return DPIUtil.autoScaleUp(s.getClientArea());
+        }
+        try {
+            return (Rectangle) swt_scrollable_clientAreaInPixels.invoke(s);
+        } catch (final Throwable e) {
+            throw new NativeWindowException(e);
+        }
+    }
 
     /**
      * @param swtControl the SWT Control to retrieve the native widget-handle from
@@ -510,7 +610,7 @@ public class SWTAccessor {
     public static long createCompatibleX11ChildWindow(final AbstractGraphicsScreen screen, final Control swtControl, final int visualID, final int width, final int height) {
         final long handle = getHandle(swtControl);
         final long parentWindow = gdk_widget_get_window( handle );
-        gdk_window_set_back_pixmap (parentWindow, 0, false);
+        // gdk_window_set_back_pixmap(parentWindow, 0, false);
 
         final long x11ParentHandle = gdk_window_get_xwindow(parentWindow);
         final long x11WindowHandle = X11Lib.CreateWindow(x11ParentHandle, screen.getDevice().getHandle(), screen.getIndex(), visualID, width, height, true, true);
